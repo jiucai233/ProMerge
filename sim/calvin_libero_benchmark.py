@@ -85,6 +85,11 @@ def run_calvin_evaluation(policy, device, norm_stats, sandbox, num_rollouts, ren
         
         # Sequentially evaluate the chain
         for t_idx, task_id in enumerate(task_sequence):
+            # Reset gate temporal smoothing at every task boundary: the target object
+            # changes between sub-tasks, so the previous task's gate must not leak in.
+            if hasattr(policy.model, 'gatekeeper') and hasattr(policy.model.gatekeeper, 'reset_history'):
+                policy.model.gatekeeper.reset_history()
+
             # Prepare slow semantic representation
             slow_semantic = None
             if slow_semantic_template is not None:
@@ -447,6 +452,10 @@ def run_libero_evaluation(policy, device, norm_stats, sandbox, num_rollouts, ren
                 
                 chain_success = True
                 for step_task_id in chain:
+                    # Reset gate temporal smoothing at each chain step (target changes).
+                    if hasattr(policy.model, 'gatekeeper') and hasattr(policy.model.gatekeeper, 'reset_history'):
+                        policy.model.gatekeeper.reset_history()
+
                     # Semantic representation
                     step_semantic = None
                     if slow_semantic_template is not None:
@@ -709,10 +718,10 @@ def run_evaluation(selected_variant, num_calvin_rollouts=10, num_libero_rollouts
     dummy_slow_semantic = torch.randn(1, 512).to(device) if selected_variant == PolicyVariant.PROMERGE_FILM else None
     for _ in range(3):
         with torch.no_grad():
-            if dummy_slow_semantic is not None:
-                _ = policy.model(dummy_qpos, dummy_img.unsqueeze(0), None, slow_semantic=dummy_slow_semantic)
-            else:
-                _ = policy(dummy_qpos, dummy_img.unsqueeze(0))
+            # Go through the policy wrapper (which applies ImageNet normalization) for
+            # both variants so warmup matches the real inference path. slow_semantic is
+            # None for non-FILM variants, which the wrapper handles.
+            _ = policy(dummy_qpos, dummy_img.unsqueeze(0), slow_semantic=dummy_slow_semantic)
                 
     # Run CALVIN
     lh1, lh2, lh3, lh4, lh5, avg_len = run_calvin_evaluation(

@@ -4,6 +4,9 @@ import os
 import sys
 import argparse
 
+# Make src/ importable so we can read the real CONFIG (image size, keep ratio, etc.)
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'src'))
+
 # Scenarios / Variants configurations
 VARIANTS_CONFIG = [
     ("MONOLITHIC_ACT", "True", "Native ACT (No compression)"),
@@ -16,23 +19,82 @@ VARIANTS_CONFIG = [
     ("PROMERGE_FILM", "True", "ProMerge Final: Token Merging (VLA + ToMe, Ours)")
 ]
 
-def compute_analytical_gflops(variant_name, merge_mode, num_cameras=2, keep_ratio=0.3):
-    # Backbone: ~22.04 GFLOPs per camera (ResNet18 on 480x640)
-    backbone_gflops = num_cameras * 22.04
-    
-    # Sequence length
-    seq_len = 600 if variant_name == "MONOLITHIC_ACT" else int(600 * keep_ratio)
-    
-    # Encoder (4 layers)
-    enc_gflops = 4 * (16 * seq_len * (512**2) + 4 * (seq_len**2) * 512) / 1e9
-    
-    # Decoder (7 layers)
-    dec_gflops = 7 * (20 * 100 * (512**2) + 4 * 100 * seq_len * 512) / 1e9
-    
-    total = backbone_gflops + enc_gflops + dec_gflops
-    # Calibrated scaling for other overheads
-    scaling_factor = 1.3090 if variant_name == "MONOLITHIC_ACT" else 1.1655
-    return round(total * scaling_factor, 2)
+def compute_analytical_gflops(variant_name, merge_mode, num_cameras=2, keep_ratio=None):
+    """Analytical inference FLOPs (FLOPs = 2 x MACs) that reflect the ACTUAL per-variant
+    architecture as configured in src/config.py and sim/calvin_libero_benchmark.py.
+
+    Key facts the previous version got wrong and this one respects:
+      * MONOLITHIC_ACT / RANDOM_PRUNE / TOME_CLUSTERING run on ResNet18 + hidden_dim 512.
+      * PROMERGE_ONLY / PROMERGE_FILM run on ViT-Small + hidden_dim 384, with mid-layer
+        token pruning so the second half of the ViT runs on the reduced token set.
+      * Everything runs at CONFIG['image_size'] (240x320), not 480x640.
+      * Token counts come from the real backbone strides, not a hardcoded 600.
+    """
+    # Read the real config when possible; fall back to known defaults otherwise.
+    try:
+        from config import CONFIG
+        H, W = CONFIG.get("image_size", (240, 320))
+        keep_ratio = CONFIG.get("keep_ratio", 0.3) if keep_ratio is None else keep_ratio
+        prune_layer = CONFIG.get("vit_pruning_layer", 6)
+    except Exception:
+        H, W = (240, 320)
+        keep_ratio = keep_ratio if keep_ratio is not None else 0.3
+        prune_layer = 6
+
+    def attn_macs(Lq, Lkv, dim):
+        # q/out proj (2*Lq) + k/v proj (2*Lkv), each *dim*dim, plus QK^T and A·V (2*Lq*Lkv*dim)
+        return 2 * Lq * dim * dim + 2 * Lkv * dim * dim + 2 * Lq * Lkv * dim
+
+    def mlp_macs(L, dim, ffn):
+        return 2 * L * dim * ffn
+
+    is_promerge = variant_name in ("PROMERGE_ONLY", "PROMERGE_FILM")
+
+    # --- hidden dims for the ACT transformer (matches run_evaluation routing) ---
+    if is_promerge:
+        d, ff = 384, 1536
+    else:
+        d, ff = 512, 3200
+
+    macs = 0.0
+
+    # --- Visual backbone ---
+    if is_promerge:
+        patch = 16
+        ppc = (H // patch) * (W // patch)          # patches per camera (15*20 = 300)
+        n_full = ppc * num_cameras                  # tokens before pruning
+        n_keep = int(n_full * keep_ratio)           # joint tokens kept after gate
+        depth = 12                                  # ViT-Small blocks
+        # patch-embed conv
+        macs += n_full * (patch * patch * 3 * d)
+        # first half: per-camera self-attention over ppc tokens
+        macs += num_cameras * prune_layer * (attn_macs(ppc, ppc, d) + mlp_macs(ppc, d, 4 * d))
+        # second half: runs jointly on the pruned token set
+        macs += (depth - prune_layer) * (attn_macs(n_keep, n_keep, d) + mlp_macs(n_keep, d, 4 * d))
+        # gatekeeper selector ~ O(N_v^2 * D) score matrix
+        macs += n_full * n_full * d
+        n_vis = n_keep
+    else:
+        gh = -(-H // 32)                            # ResNet18 stride 32, ceil-divide
+        gw = -(-W // 32)
+        n_full = gh * gw * num_cameras
+        # ResNet18: 1.82 GMACs @224x224, scaled by pixel area and #cameras
+        macs += 1.82e9 * (H * W) / (224 * 224) * num_cameras
+        # ResNet baselines prune AFTER the backbone, so only the ACT sees fewer tokens.
+        n_vis = n_full if variant_name == "MONOLITHIC_ACT" else int(n_full * keep_ratio)
+
+    # --- ACT transformer at inference: encoder over memory + decoder for 100 queries ---
+    enc_layers, dec_layers, n_queries = 4, 7, 100
+    mem = n_vis + 2                                  # visual tokens + proprio + latent
+    macs += enc_layers * (attn_macs(mem, mem, d) + mlp_macs(mem, d, ff))
+    macs += dec_layers * (
+        attn_macs(n_queries, n_queries, d)          # decoder self-attention
+        + attn_macs(n_queries, mem, d)              # decoder cross-attention to memory
+        + mlp_macs(n_queries, d, ff)
+    )
+
+    gflops = 2.0 * macs / 1e9                        # FLOPs = 2 x MACs
+    return round(gflops, 2)
 
 def main():
     parser = argparse.ArgumentParser(description="CALVIN and LIBERO aggregation pipeline")
