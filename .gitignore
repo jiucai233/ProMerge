@@ -1,0 +1,13 @@
+__pycache__/
+.venv/
+.DS_Store
+data/
+checkpoints/
+*wandb
+robo_assets/
+MUJOCO_LOG.TXT
+error_log.txt
+scratch/
+result/
+eval_results_matrix.md
+*.png

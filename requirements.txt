@@ -1,0 +1,25 @@
+# --- 核心深度学习底座 (M1 Mac 自动匹配 MPS 硬件加速) ---
+torch
+torchvision
+
+# --- MuJoCo 原生仿真与上帝视角数据厂 ---
+mujoco
+h5py
+
+# --- 视觉特征提取与 Transformer 矩阵加速 ---
+transformers
+timm
+einops
+
+# --- 劫持自 ACT 的纯数学/时序控制外设 ---
+pyyaml
+mediapy
+pexpect
+ipython
+packaging
+matplotlib
+pyquaternion
+opencv-python
+scipy
+numpy
+wandb
