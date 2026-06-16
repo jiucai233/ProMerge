@@ -19,6 +19,30 @@ for _p in (os.path.join(_ROOT, "src"), _ROOT):
         sys.path.insert(0, _p)
 
 import torch
+import signal
+
+# Set by SIGTERM/SIGINT (AWS spot interruption sends SIGTERM) -> checkpoint & exit cleanly.
+_INTERRUPTED = False
+
+
+def _install_signal_handler():
+    def _handler(signum, frame):
+        global _INTERRUPTED
+        _INTERRUPTED = True
+        print(f"\n⚠️ Caught signal {signum} (spot interruption?) — will checkpoint at next batch.", flush=True)
+    for _s in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(_s, _handler)
+        except Exception:
+            pass
+
+
+def _atomic_save(obj, path):
+    """Atomic torch.save: write .tmp then os.replace — never leaves a half-written ckpt
+    if the spot instance is reclaimed mid-write."""
+    tmp = path + ".tmp"
+    torch.save(obj, tmp)
+    os.replace(tmp, path)
 
 
 def _load_py(path, name="_m"):
@@ -67,30 +91,51 @@ def train_experiment(experiment, baseline_name, epochs=50, batch_size=16,
     if checkpoint_dir is None:
         checkpoint_dir = os.path.join(_ROOT, "checkpoints", experiment.NAME_SLUG, baseline_name)
     os.makedirs(checkpoint_dir, exist_ok=True)
+    _install_signal_handler()
+    state_path = os.path.join(checkpoint_dir, "train_state.pt")   # full resumable state
+    gk = getattr(policy.model, "gatekeeper", None)
 
     print(f"==> [{experiment.NAME} x {baseline_name}] device={device} "
           f"variant={CONFIG['variant'].name} text={uses_text} -> {checkpoint_dir}", flush=True)
 
-    # --- wandb (optional; never let it kill training) ---
+    # --- resume (spot-safe): restore model, optimizer, epoch, early-stop & wandb run id ---
+    start_epoch = 0
+    best_val = float("inf")
+    no_improve = 0
+    wandb_id = None
+    if os.path.exists(state_path):
+        try:
+            st = torch.load(state_path, map_location=device)
+            policy.load_state_dict(st["model"])
+            optimizer.load_state_dict(st["optimizer"])
+            start_epoch = int(st.get("epoch", 0))
+            best_val = float(st.get("best_val", float("inf")))
+            no_improve = int(st.get("no_improve", 0))
+            wandb_id = st.get("wandb_id")
+            if gk is not None and hasattr(gk, "tp_step") and "tp_step" in st:
+                gk.tp_step.fill_(int(st["tp_step"]))
+            print(f"↻ Resuming from epoch {start_epoch} (best_val {best_val:.4f})", flush=True)
+        except Exception as e:
+            print(f"⚠️ Could not load resume state ({e}); starting fresh.", flush=True)
+
+    # --- wandb: resume the SAME run id across spot restarts (never let it kill training) ---
     run = None
     try:
         import wandb
+        if wandb_id is None:
+            wandb_id = wandb.util.generate_id()
         run = wandb.init(
-            project="ProMerge",
+            project="ProMerge", id=wandb_id, resume="allow",
             name=f"{experiment.NAME_SLUG}_{baseline_name}_bs{batch_size}",
             group=experiment.NAME_SLUG,
             config={
-                "experiment": experiment.NAME_SLUG,
-                "baseline": baseline_name,
-                "variant": CONFIG["variant"].name,
-                "epochs": epochs,
-                "batch_size": batch_size,
-                "keep_ratio": CONFIG.get("keep_ratio"),
-                "merge_tokens": CONFIG.get("merge_tokens"),
+                "experiment": experiment.NAME_SLUG, "baseline": baseline_name,
+                "variant": CONFIG["variant"].name, "epochs": epochs, "batch_size": batch_size,
+                "keep_ratio": CONFIG.get("keep_ratio"), "merge_tokens": CONFIG.get("merge_tokens"),
                 "uses_text": uses_text,
             },
         )
-        print(f"🚀 wandb run: {run.name}", flush=True)
+        print(f"🚀 wandb run: {run.name} (id={wandb_id}, resumed={start_epoch > 0})", flush=True)
     except Exception as e:
         print(f"⚠️ wandb init failed ({e}); continuing without wandb.", flush=True)
 
@@ -113,14 +158,19 @@ def train_experiment(experiment, baseline_name, epochs=50, batch_size=16,
                 images[:, ci] = augs[ci](images[:, ci])
         return policy(qpos, images, actions, is_pad, slow_semantic=slow)
 
-    # --- early stopping state (config-driven; tracks best val) ---
-    best_val = float("inf")
-    no_improve = 0
     es_enabled = CONFIG.get("early_stop_enabled", False)
     es_patience = CONFIG.get("early_stop_patience", 5)
     es_delta = CONFIG.get("early_stop_min_delta", 1e-3)
 
-    for epoch in range(epochs):
+    def _save_state(next_epoch):
+        _atomic_save({
+            "model": policy.state_dict(), "optimizer": optimizer.state_dict(),
+            "epoch": next_epoch, "best_val": best_val, "no_improve": no_improve,
+            "wandb_id": wandb_id,
+            "tp_step": int(gk.tp_step.item()) if (gk is not None and hasattr(gk, "tp_step")) else 0,
+        }, state_path)
+
+    for epoch in range(start_epoch, epochs):
         policy.train()
         tot = n = 0
         for images, qpos, actions, is_pad, slow in train_loader:
@@ -129,6 +179,15 @@ def train_experiment(experiment, baseline_name, epochs=50, batch_size=16,
             loss_dict["loss"].backward()
             optimizer.step()
             tot += loss_dict["loss"].item(); n += 1
+            if _INTERRUPTED:
+                # spot reclaim: persist (resume re-runs this epoch from scratch) and exit cleanly
+                _save_state(epoch)
+                _atomic_save(policy.state_dict(), os.path.join(checkpoint_dir, "policy_last.ckpt"))
+                print(f"💾 Saved at epoch {epoch} on interruption — exiting for spot reclaim.", flush=True)
+                if run is not None:
+                    try: wandb.finish()
+                    except Exception: pass
+                sys.exit(0)
         train_loss = tot / max(n, 1)
 
         # Validation every 10 epochs
@@ -153,7 +212,7 @@ def train_experiment(experiment, baseline_name, epochs=50, batch_size=16,
             if val_loss < best_val - es_delta:
                 best_val = val_loss
                 no_improve = 0
-                torch.save(policy.state_dict(), os.path.join(checkpoint_dir, "policy_best.ckpt"))
+                _atomic_save(policy.state_dict(), os.path.join(checkpoint_dir, "policy_best.ckpt"))
                 print(f"  ↳ new best val {best_val:.4f} → policy_best.ckpt", flush=True)
             else:
                 no_improve += 1
@@ -169,10 +228,12 @@ def train_experiment(experiment, baseline_name, epochs=50, batch_size=16,
             except Exception:
                 pass
 
-        torch.save(policy.state_dict(), os.path.join(checkpoint_dir, "policy_last.ckpt"))
+        # atomic checkpoints + resumable state (epoch+1 = next epoch to run on restart)
+        _atomic_save(policy.state_dict(), os.path.join(checkpoint_dir, "policy_last.ckpt"))
+        _save_state(epoch + 1)
         if (epoch + 1) % 100 == 0:
-            torch.save(policy.state_dict(),
-                       os.path.join(checkpoint_dir, f"policy_epoch{epoch + 1:04d}.ckpt"))
+            _atomic_save(policy.state_dict(),
+                         os.path.join(checkpoint_dir, f"policy_epoch{epoch + 1:04d}.ckpt"))
 
         if stop:
             print(f"⏹️ Early stop at epoch {epoch} (no val improvement for "
@@ -184,6 +245,11 @@ def train_experiment(experiment, baseline_name, epochs=50, batch_size=16,
             wandb.finish()
         except Exception:
             pass
+
+    # training complete — drop resume state so a fresh re-run doesn't think it's mid-flight
+    if os.path.exists(state_path):
+        try: os.remove(state_path)
+        except Exception: pass
 
     print(f"✅ Training done: {experiment.NAME_SLUG} x {baseline_name}", flush=True)
     return checkpoint_dir

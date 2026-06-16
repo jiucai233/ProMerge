@@ -90,6 +90,34 @@ disk). Next time, just re-attach the disk and re-run it (it keeps existing data)
 Alternative (no managed disk): keep a **bucket as the durable home** — download data per run
 and push checkpoints back via `BUCKET=` in `cloud/run_all.sh`. Simpler, but re-downloads each run.
 
+## 2c. Spot instances — auto-resume (storage/compute separation)
+
+Training is **spot-safe**: `experiments/_trainer.py` saves a full `train_state.pt`
+(model + optimizer + epoch + early-stop state + wandb run id) **atomically every epoch and on
+SIGTERM** (the signal AWS sends on a spot reclaim). Re-running the *same* command continues
+from the saved epoch and **resumes the same wandb run** (no new curve). Plain `policy_last.ckpt`
+/ `policy_best.ckpt` are also written atomically (no more half-written files).
+
+For this to survive a reclaim, `train_state.pt` must live on **storage that outlives the
+instance** — i.e. the separate disk from §2b:
+
+1. Create the EBS volume **`delete-on-termination = false`** and **pin the spot request to one
+   AZ** (EBS is AZ-locked, so the replacement spot must come up in the same AZ to reattach).
+2. On reclaim → launch a new spot in that AZ → attach the volume → on the box:
+   ```bash
+   cd ProMerge && sudo bash cloud/mount_disk.sh /dev/nvme1n1 /mnt/promerge   # reattach (keeps data)
+   source .venv/bin/activate && source cloud/env.sh
+   python -u experiments/run.py --experiment libero_spatial --baseline promerge_film \
+     --mode train --epochs 250 --batch_size 32         # ← prints "↻ Resuming from epoch N"
+   ```
+3. **Unattended**: put that train command in EC2 **user-data** or a **systemd** service so a
+   replacement spot resumes by itself. `cloud/run_all.sh` is also re-run-safe (each variant
+   resumes from its own `train_state.pt`).
+
+Cross-AZ alternative (if you can't pin the AZ): use **S3** as the durable home and
+`aws s3 sync checkpoints/ s3://bucket/ckpts/` periodically; on boot, `aws s3 sync` it back
+before launching training. EBS-reattach in one AZ is simpler — prefer it unless you need AZ flexibility.
+
 ## 3. Get the data
 
 **LIBERO-Spatial (5.8 GB)** — download on the box (same official source as local):
