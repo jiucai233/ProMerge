@@ -20,11 +20,33 @@ import torch.nn.functional as F
 from config import PolicyVariant, CONFIG
 
 
+def rms_norm(x, eps=1e-6):
+    """RMSNorm without learnable gain (as used in ThinkProprio's selector)."""
+    return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps)
+
+
 class PerceptualGatekeeper(nn.Module):
-    def __init__(self, feature_dim, qpos_dim, num_gate_queries=8, num_heads=4, slow_semantic_dim=512):
+    def __init__(self, feature_dim, qpos_dim, num_gate_queries=8, num_heads=4, slow_semantic_dim=384):
         super().__init__()
         self.feature_dim = feature_dim
+        self.qpos_dim = qpos_dim
         self.num_gate_queries = num_gate_queries
+
+        # ============================================================
+        # ThinkProprio baseline (faithful reimplementation of Sec 3.3)
+        # Guidance H_q = [H_l (instruction); H_p (text-tokenized proprio)].
+        # ============================================================
+        self.tp_num_bins = CONFIG.get("tp_num_bins", 256)
+        # Proprio "text" tokenization: discretize each qpos dim -> learnable embedding
+        # (local analogue of reusing the VLM vocab embedding table; no VLM available here).
+        self.tp_proprio_embed = nn.Embedding(self.tp_num_bins, feature_dim)
+        # Instruction guidance token: project slow_semantic into the token space.
+        self.tp_lang_proj = nn.Linear(slow_semantic_dim, feature_dim)
+        # Annealed Gumbel temperature schedule (cosine), driven by a forward-step counter.
+        self.register_buffer("tp_step", torch.zeros(1, dtype=torch.long), persistent=False)
+        self.tp_alpha_start = CONFIG.get("tp_alpha_start", 1.0)
+        self.tp_alpha_end = CONFIG.get("tp_alpha_end", 0.01)
+        self.tp_anneal_steps = CONFIG.get("tp_anneal_steps", 5000)
 
         # ============================================================
         # Target-Centric Attention Gate (Option 2: Biomimetic Dynamic Filter)
@@ -139,6 +161,14 @@ class PerceptualGatekeeper(nn.Module):
                 pruned_pos = torch.gather(pos_tokens, 1, topk_indices_final.unsqueeze(-1).expand(-1, -1, C_pos))
                 return result_visual, pruned_pos
             return result_visual
+
+        # ==========================================
+        # Variant 6: ThinkProprio baseline (vote-based hard selection, Sec 3.3)
+        # ==========================================
+        elif CONFIG["variant"] == PolicyVariant.THINKPROPRIO:
+            return self._thinkproprio_select(
+                visual_tokens, qpos, slow_semantic, pos_tokens, keep_k
+            )
 
         # ==========================================
         # Variant 4 & 5: ProMerge (Cross-Attention Kinematic Gate)
@@ -258,3 +288,94 @@ class PerceptualGatekeeper(nn.Module):
                 pruned_pos = torch.gather(pos_tokens, 1, topk_indices_final.unsqueeze(-1).expand(-1, -1, C_pos))
                 return result_visual, pruned_pos
             return result_visual
+
+    def _build_proprio_tokens(self, qpos):
+        """Text-tokenize proprioception (ThinkProprio Sec 3.2 analogue).
+
+        qpos is already z-normalized upstream, so the paper's [-3, 3] clip range maps
+        naturally onto the standardized state. Each dim -> a bin index -> a learnable
+        embedding (local stand-in for the VLM token embedding table).
+        """
+        q = torch.clamp(qpos, -3.0, 3.0)
+        bins = torch.floor((q + 3.0) / 6.0 * self.tp_num_bins)
+        bins = torch.clamp(bins, 0, self.tp_num_bins - 1).long()  # [B, p]
+        return self.tp_proprio_embed(bins)  # [B, p, D]
+
+    def _current_gumbel_alpha(self):
+        if self.tp_anneal_steps <= 0:
+            return self.tp_alpha_end
+        t = float(self.tp_step.item()) / float(self.tp_anneal_steps)
+        t = min(max(t, 0.0), 1.0)
+        cos = 0.5 * (1.0 + math.cos(math.pi * t))  # 1 -> 0
+        return self.tp_alpha_end + (self.tp_alpha_start - self.tp_alpha_end) * cos
+
+    def _thinkproprio_select(self, visual_tokens, qpos, slow_semantic, pos_tokens, keep_k):
+        """Physically grounded vote-based token selection with Gumbel + STE (Sec 3.3).
+
+        Deviation from the paper, for batched fixed-budget comparison with ProMerge:
+        the paper keeps every token receiving >=1 vote (variable count ~15%); here we
+        keep the top-`keep_k` tokens ranked by vote count (with annealed Gumbel noise
+        during training), so all variants share an identical token footprint. Gradients
+        still flow through the soft per-token selection probability via the STE weight.
+        Selection is HARD removal (not merging) — the deliberate contrast with ProMerge.
+        """
+        B, N, D = visual_tokens.shape
+        Hv = visual_tokens
+
+        # ---- Guidance tokens H_q = [H_l; H_p] ----
+        guidance = [self._build_proprio_tokens(qpos)]  # H_p: [B, p, D]
+        if slow_semantic is not None:
+            Hl = self.tp_lang_proj(slow_semantic).unsqueeze(1)  # [B, 1, D]
+            guidance.insert(0, Hl)
+        Hq = torch.cat(guidance, dim=1)  # [B, Nq, D]
+
+        Hv_n = rms_norm(Hv)
+        Hq_n = rms_norm(Hq)
+
+        # ---- Per-vision query and score matrix ----
+        attn = torch.softmax(torch.bmm(Hv_n, Hq_n.transpose(1, 2)) / math.sqrt(D), dim=-1)  # [B, N, Nq]
+        Q = torch.bmm(attn, Hq)  # [B, N, D]
+        Qn = rms_norm(Q)
+        S = torch.bmm(Qn, Hv_n.transpose(1, 2))  # [B, N, N]
+
+        # ---- Annealed Gumbel perturbation (train only) ----
+        if self.training:
+            alpha = self._current_gumbel_alpha()
+            U = torch.rand_like(S).clamp_(1e-9, 1.0)
+            G = -torch.log(-torch.log(U))
+            S_hat = S + alpha * G
+            self.tp_step += 1
+        else:
+            alpha = self.tp_alpha_end
+            S_hat = S
+
+        # ---- Votes (argmax per row) and soft selection prob ----
+        votes = S_hat.argmax(dim=-1)  # [B, N]
+        vote_count = torch.zeros(B, N, device=Hv.device).scatter_add_(
+            1, votes, torch.ones(B, N, device=Hv.device)
+        )  # [B, N]
+        P = torch.softmax(S_hat / alpha, dim=-1)  # [B, N, N]
+        p_bar = P.mean(dim=1)  # [B, N] expected per-token selection probability
+
+        # ---- Fixed-budget keep ranked by votes (tie-break by p_bar) ----
+        rank = vote_count + p_bar
+        topk_indices = torch.topk(rank, keep_k, dim=1).indices  # [B, keep_k]
+        m = torch.zeros(B, N, device=Hv.device).scatter_(1, topk_indices, 1.0)
+
+        # ---- Straight-through estimator: forward=hard, backward=soft ----
+        w = m + p_bar - p_bar.detach()  # [B, N]
+        Hv_cond = Hv * w.unsqueeze(-1)
+
+        kept = torch.gather(Hv_cond, 1, topk_indices.unsqueeze(-1).expand(-1, -1, D))  # [B, keep_k, D]
+        ctx = Hv.mean(dim=1, keepdim=True)  # [B, 1, D] global context token
+        result_visual = torch.cat([kept, ctx], dim=1)  # [B, keep_k + 1, D]
+
+        if pos_tokens is not None:
+            C_pos = pos_tokens.shape[-1]
+            if pos_tokens.shape[0] == 1:
+                pos_tokens = pos_tokens.expand(B, -1, -1)
+            pos_kept = torch.gather(pos_tokens, 1, topk_indices.unsqueeze(-1).expand(-1, -1, C_pos))
+            pos_ctx = pos_tokens.mean(dim=1, keepdim=True)
+            pos_out = torch.cat([pos_kept, pos_ctx], dim=1)
+            return result_visual, pos_out
+        return result_visual

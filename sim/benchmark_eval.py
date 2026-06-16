@@ -129,7 +129,7 @@ def run_evaluation(selected_variant=None, task_name="static_manipulation", noise
         img_h, img_w = CONFIG.get("image_size", (480, 640))
         dummy_img = torch.randn(num_cameras, 3, img_h, img_w).to(device)
         dummy_qpos = torch.randn(1, CONFIG['qpos_dim']).to(device)
-        dummy_slow_semantic = torch.randn(1, 512).to(device) if variant == PolicyVariant.PROMERGE_FILM else None
+        dummy_slow_semantic = torch.randn(1, 384).to(device) if variant in (PolicyVariant.PROMERGE_FILM, PolicyVariant.THINKPROPRIO) else None
         for _ in range(5):
             with torch.no_grad():
                 if dummy_slow_semantic is not None:
@@ -144,10 +144,14 @@ def run_evaluation(selected_variant=None, task_name="static_manipulation", noise
         # Generate constant slow_semantic globally for the evaluation
         slow_semantic = None
         if variant == PolicyVariant.PROMERGE_FILM and task_name != "multi_object_sorting":
-            state = torch.random.get_rng_state()
-            torch.manual_seed(42)
-            slow_semantic = torch.randn(1, 512).to(device)
-            torch.random.set_rng_state(state)
+            try:
+                from utils import encode_text_instruction
+                slow_semantic = encode_text_instruction("pick the sphere", device=device).unsqueeze(0)
+            except Exception:
+                state = torch.random.get_rng_state()
+                torch.manual_seed(42)
+                slow_semantic = torch.randn(1, 384).to(device)
+                torch.random.set_rng_state(state)
             
         query_frequency = 1 if POLICY_CONFIG.get('temporal_agg', False) else 100
         print(f"Evaluating Variant: {variant.name} across {num_rollouts} rollouts...")
@@ -167,11 +171,21 @@ def run_evaluation(selected_variant=None, task_name="static_manipulation", noise
             # For multi_object_sorting, slow_semantic updates dynamically per rollout based on task_id
             if task_name == "multi_object_sorting" and variant == PolicyVariant.PROMERGE_FILM:
                 task_id = r % 3
-                seed_val = 42 if task_id == 0 else 1000 + task_id
-                state = torch.random.get_rng_state()
-                torch.manual_seed(seed_val)
-                slow_semantic = torch.randn(1, 512).to(device)
-                torch.random.set_rng_state(state)
+                task_strings = {
+                    0: "pick the sphere",
+                    1: "pick the box",
+                    2: "pick the cylinder"
+                }
+                text = task_strings.get(task_id, "pick the sphere")
+                try:
+                    from utils import encode_text_instruction
+                    slow_semantic = encode_text_instruction(text, device=device).unsqueeze(0)
+                except Exception:
+                    seed_val = 42 if task_id == 0 else 1000 + task_id
+                    state = torch.random.get_rng_state()
+                    torch.manual_seed(seed_val)
+                    slow_semantic = torch.randn(1, 384).to(device)
+                    torch.random.set_rng_state(state)
             
             # Configure task specific sandbox states
             if task_name == "dyn_intercept":

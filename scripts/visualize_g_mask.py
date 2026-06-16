@@ -118,7 +118,7 @@ def main():
 
         # Generate fixed slow_semantic (zeros or random with seed)
         torch.manual_seed(42)
-        slow_semantic = torch.randn(1, 512).to(device)
+        slow_semantic = torch.randn(1, 384).to(device)
 
         # Run forward pass
         with torch.no_grad():

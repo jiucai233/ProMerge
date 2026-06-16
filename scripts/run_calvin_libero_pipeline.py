@@ -15,7 +15,7 @@ VARIANTS_CONFIG = [
     ("TOME_CLUSTERING", "True", "Competitor: Token Merging (ToMe clustering)"),
     ("PROMERGE_ONLY", "False", "ProMerge Only: Hard Selection (No FiLM, Ours)"),
     ("PROMERGE_ONLY", "True", "ProMerge Only: Token Merging (No FiLM, Ours)"),
-    ("PROMERGE_FILM", "False", "ThinkProprio Baseline: Hard Selection (VLA + Pruning)"),
+    ("THINKPROPRIO", "False", "ThinkProprio (Paper Reimpl.): Vote-based Hard Pruning"),
     ("PROMERGE_FILM", "True", "ProMerge Final: Token Merging (VLA + ToMe, Ours)")
 ]
 
@@ -48,7 +48,8 @@ def compute_analytical_gflops(variant_name, merge_mode, num_cameras=2, keep_rati
     def mlp_macs(L, dim, ffn):
         return 2 * L * dim * ffn
 
-    is_promerge = variant_name in ("PROMERGE_ONLY", "PROMERGE_FILM")
+    # ViT-Small backbone variants (ProMerge + the ThinkProprio reimplementation).
+    is_promerge = variant_name in ("PROMERGE_ONLY", "PROMERGE_FILM", "THINKPROPRIO")
 
     # --- hidden dims for the ACT transformer (matches run_evaluation routing) ---
     if is_promerge:
@@ -95,6 +96,19 @@ def compute_analytical_gflops(variant_name, merge_mode, num_cameras=2, keep_rati
 
     gflops = 2.0 * macs / 1e9                        # FLOPs = 2 x MACs
     return round(gflops, 2)
+
+def _col_best(rows, key, lower_better=False):
+    vals = [r.get(key, 0.0) for r in rows]
+    if not vals:
+        return None
+    return min(vals) if lower_better else max(vals)
+
+
+def _fmt(val, best, pct=True, dec=1):
+    s = f"{val:.{dec}f}%" if pct else f"{val:.{dec}f}"
+    # Bold the column-best cell ("best in bold", per the table caption).
+    return f"**{s}**" if (best is not None and abs(val - best) < 1e-9) else s
+
 
 def main():
     parser = argparse.ArgumentParser(description="CALVIN and LIBERO aggregation pipeline")
@@ -195,21 +209,23 @@ def main():
     report_lines.append("| Method | GFLOPs ↓ | LH-1 ↑ | LH-2 ↑ | LH-3 ↑ | LH-4 ↑ | LH-5 ↑ | Avg. Len. ↑ |")
     report_lines.append("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
     
+    calvin_rows = [results.get(pn, {}) for _, _, pn in VARIANTS_CONFIG]
+    cbest = {
+        "gflops": _col_best(calvin_rows, "gflops", lower_better=True),
+        "lh1": _col_best(calvin_rows, "lh1"), "lh2": _col_best(calvin_rows, "lh2"),
+        "lh3": _col_best(calvin_rows, "lh3"), "lh4": _col_best(calvin_rows, "lh4"),
+        "lh5": _col_best(calvin_rows, "lh5"), "avg_len": _col_best(calvin_rows, "avg_len"),
+    }
     for _, _, pretty_name in VARIANTS_CONFIG:
         m = results.get(pretty_name, {})
-        gflops = m.get("gflops", 0.0)
-        lh1 = m.get("lh1", 0.0)
-        lh2 = m.get("lh2", 0.0)
-        lh3 = m.get("lh3", 0.0)
-        lh4 = m.get("lh4", 0.0)
-        lh5 = m.get("lh5", 0.0)
-        avg_len = m.get("avg_len", 0.0)
-        
-        # Highlight our final model
-        if pretty_name == "ProMerge Final: Token Merging (VLA + ToMe, Ours)":
-            row = f"| **`{pretty_name}`** | {gflops:.2f} | **{lh1:.1f}%** | **{lh2:.1f}%** | **{lh3:.1f}%** | **{lh4:.1f}%** | **{lh5:.1f}%** | **{avg_len:.2f}** |"
-        else:
-            row = f"| `{pretty_name}` | {gflops:.2f} | {lh1:.1f}% | {lh2:.1f}% | {lh3:.1f}% | {lh4:.1f}% | {lh5:.1f}% | {avg_len:.2f} |"
+        row = (f"| `{pretty_name}` "
+               f"| {_fmt(m.get('gflops',0.0), cbest['gflops'], pct=False, dec=2)} "
+               f"| {_fmt(m.get('lh1',0.0), cbest['lh1'])} "
+               f"| {_fmt(m.get('lh2',0.0), cbest['lh2'])} "
+               f"| {_fmt(m.get('lh3',0.0), cbest['lh3'])} "
+               f"| {_fmt(m.get('lh4',0.0), cbest['lh4'])} "
+               f"| {_fmt(m.get('lh5',0.0), cbest['lh5'])} "
+               f"| {_fmt(m.get('avg_len',0.0), cbest['avg_len'], pct=False, dec=2)} |")
         report_lines.append(row)
         
     report_lines.append("\n\n")
@@ -220,20 +236,22 @@ def main():
     report_lines.append("| Method | GFLOPs ↓ | Spatial ↑ | Object ↑ | Goal ↑ | Long ↑ | Avg. ↑ |")
     report_lines.append("| :--- | :---: | :---: | :---: | :---: | :---: | :---: |")
     
+    libero_rows = [results.get(pn, {}) for _, _, pn in VARIANTS_CONFIG]
+    lbest = {
+        "gflops": _col_best(libero_rows, "gflops", lower_better=True),
+        "spatial": _col_best(libero_rows, "spatial"), "object": _col_best(libero_rows, "object"),
+        "goal": _col_best(libero_rows, "goal"), "long": _col_best(libero_rows, "long"),
+        "libero_avg": _col_best(libero_rows, "libero_avg"),
+    }
     for _, _, pretty_name in VARIANTS_CONFIG:
         m = results.get(pretty_name, {})
-        gflops = m.get("gflops", 0.0)
-        spatial = m.get("spatial", 0.0)
-        obj = m.get("object", 0.0)
-        goal = m.get("goal", 0.0)
-        long_lh = m.get("long", 0.0)
-        libero_avg = m.get("libero_avg", 0.0)
-        
-        # Highlight our final model
-        if pretty_name == "ProMerge Final: Token Merging (VLA + ToMe, Ours)":
-            row = f"| **`{pretty_name}`** | {gflops:.2f} | **{spatial:.1f}%** | **{obj:.1f}%** | **{goal:.1f}%** | **{long_lh:.1f}%** | **{libero_avg:.1f}%** |"
-        else:
-            row = f"| `{pretty_name}` | {gflops:.2f} | {spatial:.1f}% | {obj:.1f}% | {goal:.1f}% | {long_lh:.1f}% | {libero_avg:.1f}% |"
+        row = (f"| `{pretty_name}` "
+               f"| {_fmt(m.get('gflops',0.0), lbest['gflops'], pct=False, dec=2)} "
+               f"| {_fmt(m.get('spatial',0.0), lbest['spatial'])} "
+               f"| {_fmt(m.get('object',0.0), lbest['object'])} "
+               f"| {_fmt(m.get('goal',0.0), lbest['goal'])} "
+               f"| {_fmt(m.get('long',0.0), lbest['long'])} "
+               f"| {_fmt(m.get('libero_avg',0.0), lbest['libero_avg'])} |")
         report_lines.append(row)
         
     report_str = "\n".join(report_lines)

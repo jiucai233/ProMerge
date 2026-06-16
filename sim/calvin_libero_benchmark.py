@@ -15,7 +15,7 @@ sys.path.append(os.path.join(project_root, 'src'))
 # Import config and utils
 import config
 from config import CONFIG, PolicyVariant, EvalNoise, POLICY_CONFIG
-from utils import make_policy, get_norm_stats
+from utils import make_policy, get_norm_stats, safe_load_state_dict
 from sim.sandbox import M1SortingSandbox
 
 def get_geom_id_by_body_name(model, body_name):
@@ -93,11 +93,22 @@ def run_calvin_evaluation(policy, device, norm_stats, sandbox, num_rollouts, ren
             # Prepare slow semantic representation
             slow_semantic = None
             if slow_semantic_template is not None:
-                seed_val = 42 if task_id == 0 else 1000 + task_id
-                state = torch.random.get_rng_state()
-                torch.manual_seed(seed_val)
-                slow_semantic = torch.randn(1, 512).to(device)
-                torch.random.set_rng_state(state)
+                task_strings = {
+                    0: "pick the sphere",
+                    1: "pick the box",
+                    2: "pick the cylinder"
+                }
+                text = task_strings.get(task_id, "pick the sphere")
+                try:
+                    from utils import encode_text_instruction
+                    slow_semantic = encode_text_instruction(text, device=device).unsqueeze(0)
+                except Exception as e:
+                    print(f"⚠️ Warning: Failed to generate real CLIP embedding for '{text}' ({e}). Falling back to random seed embedding.")
+                    seed_val = 42 if task_id == 0 else 1000 + task_id
+                    state = torch.random.get_rng_state()
+                    torch.manual_seed(seed_val)
+                    slow_semantic = torch.randn(1, 384).to(device)
+                    torch.random.set_rng_state(state)
                 
             task_success = False
             action_chunk = None
@@ -357,11 +368,22 @@ def run_libero_evaluation(policy, device, norm_stats, sandbox, num_rollouts, ren
         # Prepare slow semantic representation
         slow_semantic = None
         if slow_semantic_template is not None and suite_name != "long":
-            seed_val = 42 if task_id == 0 else 1000 + task_id
-            state = torch.random.get_rng_state()
-            torch.manual_seed(seed_val)
-            slow_semantic = torch.randn(1, 512).to(device)
-            torch.random.set_rng_state(state)
+            task_strings = {
+                0: "pick the sphere",
+                1: "pick the box",
+                2: "pick the cylinder"
+            }
+            text = task_strings.get(task_id, "pick the sphere")
+            try:
+                from utils import encode_text_instruction
+                slow_semantic = encode_text_instruction(text, device=device).unsqueeze(0)
+            except Exception as e:
+                print(f"⚠️ Warning: Failed to generate real CLIP embedding for '{text}' ({e}). Falling back to random seed embedding.")
+                seed_val = 42 if task_id == 0 else 1000 + task_id
+                state = torch.random.get_rng_state()
+                torch.manual_seed(seed_val)
+                slow_semantic = torch.randn(1, 384).to(device)
+                torch.random.set_rng_state(state)
             
         for r in range(num_rollouts):
             # Reset simulator
@@ -459,11 +481,22 @@ def run_libero_evaluation(policy, device, norm_stats, sandbox, num_rollouts, ren
                     # Semantic representation
                     step_semantic = None
                     if slow_semantic_template is not None:
-                        seed_val = 42 if step_task_id == 0 else 1000 + step_task_id
-                        state = torch.random.get_rng_state()
-                        torch.manual_seed(seed_val)
-                        step_semantic = torch.randn(1, 512).to(device)
-                        torch.random.set_rng_state(state)
+                        task_strings = {
+                            0: "pick the sphere",
+                            1: "pick the box",
+                            2: "pick the cylinder"
+                        }
+                        text = task_strings.get(step_task_id, "pick the sphere")
+                        try:
+                            from utils import encode_text_instruction
+                            step_semantic = encode_text_instruction(text, device=device).unsqueeze(0)
+                        except Exception as e:
+                            print(f"⚠️ Warning: Failed to generate real CLIP embedding for '{text}' ({e}). Falling back to random seed embedding.")
+                            seed_val = 42 if step_task_id == 0 else 1000 + step_task_id
+                            state = torch.random.get_rng_state()
+                            torch.manual_seed(seed_val)
+                            step_semantic = torch.randn(1, 384).to(device)
+                            torch.random.set_rng_state(state)
                         
                     task_success = False
                     action_chunk = None
@@ -651,7 +684,7 @@ def run_libero_evaluation(policy, device, norm_stats, sandbox, num_rollouts, ren
     return avg_sr
 
 
-def run_evaluation(selected_variant, num_calvin_rollouts=10, num_libero_rollouts=3, render=False, merge_tokens_override="default"):
+def run_evaluation(selected_variant, num_calvin_rollouts=10, num_libero_rollouts=3, render=False, merge_tokens_override="default", ckpt_path=None):
     print("====================================================")
     print("🚀 Starting CALVIN & LIBERO Emulation Evaluation")
     print(f"Variant: {selected_variant.name}")
@@ -700,12 +733,9 @@ def run_evaluation(selected_variant, num_calvin_rollouts=10, num_libero_rollouts
     policy = make_policy(POLICY_CONFIG['policy_class'], POLICY_CONFIG)
     policy.to(device)
     
-    checkpoint_path = f"checkpoints/{selected_variant.name}/policy_last.ckpt"
-    if os.path.exists(checkpoint_path):
-        print(f"Loading checkpoint from {checkpoint_path}...")
-        policy.load_state_dict(torch.load(checkpoint_path, map_location=device), strict=False)
-    else:
-        print(f"WARNING: Checkpoint {checkpoint_path} not found! Using random weights.")
+    checkpoint_path = ckpt_path if ckpt_path else f"checkpoints/{selected_variant.name}/policy_last.ckpt"
+    print(f"Loading checkpoint: {checkpoint_path}")
+    safe_load_state_dict(policy, checkpoint_path, device=device)
         
     policy.eval()
     sys.argv = original_argv
@@ -715,7 +745,7 @@ def run_evaluation(selected_variant, num_calvin_rollouts=10, num_libero_rollouts
     img_h, img_w = CONFIG.get("image_size", (480, 640))
     dummy_img = torch.randn(num_cameras, 3, img_h, img_w).to(device)
     dummy_qpos = torch.randn(1, CONFIG['qpos_dim']).to(device)
-    dummy_slow_semantic = torch.randn(1, 512).to(device) if selected_variant == PolicyVariant.PROMERGE_FILM else None
+    dummy_slow_semantic = torch.randn(1, 384).to(device) if selected_variant in (PolicyVariant.PROMERGE_FILM, PolicyVariant.THINKPROPRIO) else None
     for _ in range(3):
         with torch.no_grad():
             # Go through the policy wrapper (which applies ImageNet normalization) for
@@ -769,14 +799,18 @@ if __name__ == "__main__":
                         help="Visualize rollouts in MuJoCo viewer.")
     parser.add_argument("--merge_tokens", type=str, default="default", choices=["default", "True", "False"],
                         help="Override merge_tokens configuration.")
+    parser.add_argument("--ckpt", type=str, default=None,
+                        help="Path to a specific checkpoint to evaluate (default: checkpoints/<VARIANT>/policy_last.ckpt). "
+                             "Use to evaluate a val-selected policy_best.ckpt or a specific epoch snapshot.")
     args = parser.parse_args()
-    
+
     selected_var = PolicyVariant[args.variant]
-    
+
     run_evaluation(
         selected_variant=selected_var,
         num_calvin_rollouts=args.num_calvin_rollouts,
         num_libero_rollouts=args.num_libero_rollouts,
         render=args.render,
-        merge_tokens_override=args.merge_tokens
+        merge_tokens_override=args.merge_tokens,
+        ckpt_path=args.ckpt
     )

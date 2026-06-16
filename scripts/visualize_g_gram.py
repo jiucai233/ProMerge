@@ -90,7 +90,7 @@ def main():
         images_tensor = images_tensor.unsqueeze(0).to(device)
 
         torch.manual_seed(42)
-        slow_semantic = torch.randn(1, 512).to(device)
+        slow_semantic = torch.randn(1, 384).to(device)
 
         with torch.no_grad():
             if variant == config.PolicyVariant.PROMERGE_FILM:

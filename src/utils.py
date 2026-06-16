@@ -1,9 +1,36 @@
 import os
 import h5py
 import torch
+import torch.nn.functional as F
 import numpy as np
 from einops import rearrange
 from torch.utils.data import DataLoader
+
+
+class RandomShiftsAug:
+    """DrQ-style random shift augmentation (pad + random crop back to size).
+
+    Operates on a batched image tensor [B, C, H, W]: replicate-pads by `pad` pixels
+    then takes a random H/W crop back to the original size. Cheap and label-preserving,
+    the standard augmentation for visuomotor policies (LIBERO/ThinkProprio use it).
+    Handles non-square images. pad <= 0 is a no-op (augmentation disabled).
+    """
+
+    def __init__(self, pad=4):
+        self.pad = int(pad)
+
+    def __call__(self, x):
+        if self.pad <= 0:
+            return x
+        n, c, h, w = x.shape
+        p = self.pad
+        x = F.pad(x, (p, p, p, p), mode="replicate")
+        off_h = torch.randint(0, 2 * p + 1, (n,), device=x.device)
+        off_w = torch.randint(0, 2 * p + 1, (n,), device=x.device)
+        out = torch.empty((n, c, h, w), dtype=x.dtype, device=x.device)
+        for i in range(n):
+            out[i] = x[i, :, off_h[i]:off_h[i] + h, off_w[i]:off_w[i] + w]
+        return out
 
 # Force spawn start method for safe multiprocessing with HDF5 on macOS
 import sys
@@ -17,8 +44,45 @@ if sys.platform == 'darwin':
 
 
 
+
 import IPython
 e = IPython.embed
+
+def project_slow_semantic(embedding, target_dim=384, seed=42):
+    # Deterministic projection from 512 to target_dim
+    # We use CPU-based generator with fixed seed to ensure identity of projection matrix across processes/devices.
+    g = torch.Generator(device='cpu')
+    g.manual_seed(seed)
+    proj = torch.randn(512, target_dim, generator=g)
+    # Orthonormalize the columns of the projection matrix using QR decomposition
+    q, _ = torch.linalg.qr(proj) # Shape: [512, target_dim]
+    
+    # Perform projection
+    if isinstance(embedding, torch.Tensor):
+        return torch.matmul(embedding, q.to(embedding.device))
+    else:
+        return np.dot(embedding, q.numpy())
+
+_CLIP_TOKENIZER = None
+_CLIP_TEXT_MODEL = None
+
+def get_clip_encoder():
+    global _CLIP_TOKENIZER, _CLIP_TEXT_MODEL
+    if _CLIP_TOKENIZER is None or _CLIP_TEXT_MODEL is None:
+        from transformers import CLIPTokenizer, CLIPTextModel
+        _CLIP_TOKENIZER = CLIPTokenizer.from_pretrained('openai/clip-vit-base-patch32')
+        _CLIP_TEXT_MODEL = CLIPTextModel.from_pretrained('openai/clip-vit-base-patch32')
+        _CLIP_TEXT_MODEL.eval()
+    return _CLIP_TOKENIZER, _CLIP_TEXT_MODEL
+
+def encode_text_instruction(text, device='cpu'):
+    tokenizer, text_model = get_clip_encoder()
+    inputs = tokenizer([text], padding=True, return_tensors='pt')
+    with torch.no_grad():
+        emb = text_model(**inputs).pooler_output.squeeze(0)  # Shape: [512]
+    # Project to 384
+    projected = project_slow_semantic(emb.cpu(), target_dim=384, seed=42)
+    return projected.to(device)
 
 class EpisodicDataset(torch.utils.data.Dataset):
     def __init__(self, episode_ids, dataset_dir, camera_names, norm_stats):
@@ -28,6 +92,54 @@ class EpisodicDataset(torch.utils.data.Dataset):
         self.camera_names = camera_names
         self.norm_stats = norm_stats
         self.is_sim = True
+
+        # Pre-encode all natural language instructions using CLIP to avoid loading latency during training
+        import random
+        self.random_gen = random.Random(42)  # consistent sampling
+        
+        self.task_instructions = {
+            0: [
+                "pick up the red sphere and sort it",
+                "grasp the sphere",
+                "pick the sphere",
+                "go to get the sphere"
+            ],
+            1: [
+                "pick up the blue box and sort it",
+                "grasp the box",
+                "pick the box",
+                "go to get the box"
+            ],
+            2: [
+                "pick up the green cylinder and sort it",
+                "grasp the cylinder",
+                "pick the cylinder",
+                "go to get the cylinder"
+            ]
+        }
+        
+        # Only variants that actually consume language need the CLIP encoder.
+        # PROMERGE_ONLY (pure BC) and the vision-only baselines never use slow_semantic,
+        # so we skip loading CLIP entirely for them.
+        from config import CONFIG, PolicyVariant
+        needs_text = CONFIG.get("variant") in (PolicyVariant.PROMERGE_FILM, PolicyVariant.THINKPROPRIO)
+
+        if not needs_text:
+            print("ℹ️ Variant does not use language instructions; skipping CLIP encoder (pure BC).")
+            self.task_embeddings = None
+        else:
+            try:
+                print("🚀 Loading CLIP Text Encoder for natural language VLA instruction mapping...")
+                self.task_embeddings = {}
+                for task_id, texts in self.task_instructions.items():
+                    self.task_embeddings[task_id] = []
+                    for t in texts:
+                        emb = encode_text_instruction(t) # Shape: [384] on CPU
+                        self.task_embeddings[task_id].append(emb)
+                print("🚀 Successfully pre-encoded all natural language instructions using CLIP!")
+            except Exception as e:
+                print(f"⚠️ Warning: Failed to load CLIP text encoder ({e}). Falling back to random seed embeddings.")
+                self.task_embeddings = None
 
         # RAM Pre-loading (Pre-load the entire dataset into memory to avoid disk latency)
         print(f"Pre-loading {len(self.episode_ids)} episodes into memory...")
@@ -103,14 +215,19 @@ class EpisodicDataset(torch.utils.data.Dataset):
         if 'task_id' in ep_group.attrs:
             task_id = int(ep_group.attrs['task_id'])
             
-        # Generate constant task semantic embedding based on task_id
-        seed_val = 42 if task_id == 0 else 1000 + task_id
-        state = torch.random.get_rng_state()
-        torch.manual_seed(seed_val)
-        slow_semantic = torch.randn(512)
-        torch.random.set_rng_state(state)
+        # Get natural language instruction embedding or fall back to random seed
+        if self.task_embeddings is not None and task_id in self.task_embeddings:
+            # Randomly select one of the pre-encoded instructions for this task to act as language augmentation
+            slow_semantic = self.random_gen.choice(self.task_embeddings[task_id])
+        else:
+            seed_val = 42 if task_id == 0 else 1000 + task_id
+            state = torch.random.get_rng_state()
+            torch.manual_seed(seed_val)
+            slow_semantic = torch.randn(384)
+            torch.random.set_rng_state(state)
 
         return image_data, qpos_data, action_data, is_pad, slow_semantic
+
 
 
 def get_norm_stats(dataset_dir, num_episodes):
@@ -334,3 +451,28 @@ def norm2pwm(x:np.ndarray) -> np.ndarray:
     :return: numpy array of pwm values in range [0, 4096]
     """
     return x * 4096
+
+def safe_load_state_dict(model, checkpoint_path, device='cpu'):
+    if not os.path.exists(checkpoint_path):
+        print(f"WARNING: Checkpoint {checkpoint_path} not found! Model will use current weights.")
+        return False
+    state_dict = torch.load(checkpoint_path, map_location=device)
+    model_dict = model.state_dict()
+    filtered_dict = {}
+    mismatches = []
+    for k, v in state_dict.items():
+        if k in model_dict:
+            if v.shape == model_dict[k].shape:
+                filtered_dict[k] = v
+            else:
+                mismatches.append(f"{k} (expected {model_dict[k].shape}, got {v.shape})")
+        else:
+            # key not in model, can be ignored safely
+            pass
+            
+    if mismatches:
+        print(f"⚠️ Warning: Shape mismatch for keys, skipping them: {', '.join(mismatches)}")
+    
+    model.load_state_dict(filtered_dict, strict=False)
+    print(f"Successfully loaded checkpoint from {checkpoint_path} (strict=False)")
+    return True

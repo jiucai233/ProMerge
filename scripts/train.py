@@ -40,11 +40,15 @@ def run_online_evaluation(policy, device, norm_stats):
     
     # Generate constant slow_semantic globally for the evaluation
     slow_semantic = None
-    if CONFIG["variant"] == config.PolicyVariant.PROMERGE_FILM:
-        state = torch.random.get_rng_state()
-        torch.manual_seed(42)
-        slow_semantic = torch.randn(1, 512).to(device)
-        torch.random.set_rng_state(state)
+    if CONFIG["variant"] in (config.PolicyVariant.PROMERGE_FILM, config.PolicyVariant.THINKPROPRIO):
+        try:
+            from utils import encode_text_instruction
+            slow_semantic = encode_text_instruction("pick the sphere", device=device).unsqueeze(0)
+        except Exception:
+            state = torch.random.get_rng_state()
+            torch.manual_seed(42)
+            slow_semantic = torch.randn(1, 384).to(device)
+            torch.random.set_rng_state(state)
         
     for r in range(num_rollouts):
         # Reset sandbox with randomized initial ball trajectory (similar to dataset generator)
@@ -152,26 +156,44 @@ def run_online_evaluation(policy, device, norm_stats):
         
     return success_rate, avg_min_distance
 
-def run_training():
-    parser = argparse.ArgumentParser(description="ACT Policy Training Script")
-    parser.add_argument("--epochs", type=int, default=CONFIG.get("num_epochs", 300), help="Number of training epochs")
-    parser.add_argument("--batch_size", type=int, default=16, help="Batch size for training")
-    parser.add_argument("--checkpoint_dir", type=str, default="checkpoints/default", help="Directory to save checkpoints")
-    parser.add_argument("--variant", type=str, default=None, help="Policy variant name")
-    args = parser.parse_args()
+def run_training(epochs=None, batch_size=None, checkpoint_dir=None, variant=None,
+                 config_overrides=None, policy_overrides=None):
+    """Train an ACT policy variant.
 
-    # Apply command line overrides
-    num_epochs = args.epochs
-    batch_size = args.batch_size
-    checkpoint_dir = args.checkpoint_dir
+    Can be driven two ways:
+      * CLI (no args passed) -> arguments are parsed from argv (legacy behaviour).
+      * Programmatically -> each baselines/<name>/train.py passes its own config,
+        which is the path the new per-baseline folders use.
+    """
+    # CLI mode: nothing was passed programmatically -> parse argv.
+    if (epochs is None and batch_size is None and checkpoint_dir is None
+            and variant is None and config_overrides is None and policy_overrides is None):
+        parser = argparse.ArgumentParser(description="ACT Policy Training Script")
+        parser.add_argument("--epochs", type=int, default=CONFIG.get("num_epochs", 300), help="Number of training epochs")
+        parser.add_argument("--batch_size", type=int, default=16, help="Batch size for training")
+        parser.add_argument("--checkpoint_dir", type=str, default="checkpoints/default", help="Directory to save checkpoints")
+        parser.add_argument("--variant", type=str, default=None, help="Policy variant name")
+        args = parser.parse_args()
+        epochs, batch_size, checkpoint_dir, variant = args.epochs, args.batch_size, args.checkpoint_dir, args.variant
+
+    # Resolve defaults for any value still unset (programmatic mode).
+    num_epochs = epochs if epochs is not None else CONFIG.get("num_epochs", 300)
+    batch_size = batch_size if batch_size is not None else 16
+    checkpoint_dir = checkpoint_dir if checkpoint_dir is not None else "checkpoints/default"
     os.makedirs(checkpoint_dir, exist_ok=True)
-    
-    if args.variant is not None:
+
+    # Apply this baseline's config overrides BEFORE the policy is built.
+    if config_overrides:
+        CONFIG.update(config_overrides)
+    if policy_overrides:
+        POLICY_CONFIG.update(policy_overrides)
+
+    if variant is not None:
         from config import PolicyVariant
         try:
-            CONFIG["variant"] = PolicyVariant[args.variant]
+            CONFIG["variant"] = PolicyVariant[variant]
         except KeyError:
-            print(f"Error: Invalid policy variant name '{args.variant}'. Valid variants: {[v.name for v in PolicyVariant]}")
+            print(f"Error: Invalid policy variant name '{variant}'. Valid variants: {[v.name for v in PolicyVariant]}")
             sys.exit(1)
             
     # Configure policy parameters to align with 5-DOF Sandbox
@@ -255,7 +277,7 @@ def run_training():
             is_pad = is_pad.to(device)
             
             # Optional VLA intention embedding for variant 5
-            if CONFIG["variant"] == config.PolicyVariant.PROMERGE_FILM:
+            if CONFIG["variant"] in (config.PolicyVariant.PROMERGE_FILM, config.PolicyVariant.THINKPROPRIO):
                 slow_semantic = slow_semantic.to(device)
             else:
                 slow_semantic = None
@@ -300,7 +322,7 @@ def run_training():
                 val_is_pad = val_is_pad.to(device)
                 
                 # Optional VLA intention embedding for variant 5
-                if CONFIG["variant"] == config.PolicyVariant.PROMERGE_FILM:
+                if CONFIG["variant"] in (config.PolicyVariant.PROMERGE_FILM, config.PolicyVariant.THINKPROPRIO):
                     val_slow_semantic = val_slow_semantic.to(device)
                 else:
                     val_slow_semantic = None

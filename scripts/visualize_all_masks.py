@@ -93,7 +93,7 @@ def load_policy_and_get_masks(variant, checkpoint_path, timesteps, qpos_all, ima
         normalized_images = normalize(images_tensor)
 
         torch.manual_seed(42)
-        slow_semantic = torch.randn(1, 512).to(device)
+        slow_semantic = torch.randn(1, 384).to(device)
 
         captured_gates.clear()
 

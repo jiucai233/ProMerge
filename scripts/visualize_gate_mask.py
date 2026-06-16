@@ -136,7 +136,7 @@ def main():
     # Optional slow_semantic for PROMERGE_FILM
     slow_semantic = None
     if CONFIG["variant"] == PolicyVariant.PROMERGE_FILM:
-        slow_semantic = torch.randn(1, 512).to(device)
+        slow_semantic = torch.randn(1, 384).to(device)
     
     # === Forward pass to extract gate masks ===
     print("🔄 Running forward pass...")

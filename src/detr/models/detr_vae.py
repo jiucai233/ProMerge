@@ -99,7 +99,8 @@ class DETRVAE(nn.Module):
         self.gatekeeper = PerceptualGatekeeper(
             feature_dim=hidden_dim, qpos_dim=CONFIG["qpos_dim"],
             num_gate_queries=CONFIG.get("gate_num_queries", 8),
-            num_heads=CONFIG.get("gate_num_heads", 4)
+            num_heads=CONFIG.get("gate_num_heads", 4),
+            slow_semantic_dim=384
         )
 
     def forward(self, qpos, image, env_state, actions=None, is_pad=None, slow_semantic=None):

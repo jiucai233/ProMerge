@@ -7,8 +7,20 @@ import traceback
 # Policy variants to evaluate
 VARIANTS = [
     "PROMERGE_ONLY",
-    "PROMERGE_FILM"
+    "PROMERGE_FILM",
+    "THINKPROPRIO"
 ]
+
+# Each variant is trained through its self-contained baselines/<name>/train.py entry,
+# which applies that baseline's backbone/hidden-dim config (single source of truth).
+VARIANT_TO_FOLDER = {
+    "MONOLITHIC_ACT": "baselines/monolithic_act/train.py",
+    "RANDOM_PRUNE": "baselines/random_prune/train.py",
+    "TOME_CLUSTERING": "baselines/tome_clustering/train.py",
+    "PROMERGE_ONLY": "baselines/promerge_only/train.py",
+    "PROMERGE_FILM": "baselines/promerge_film/train.py",
+    "THINKPROPRIO": "baselines/thinkproprio/train.py",
+}
 
 def set_config_variant(variant_name):
     config_path = "src/config.py"
@@ -58,30 +70,28 @@ def run_pipeline():
             except Exception as e:
                 print(f"⚠️ Error checking checkpoint: {e}. Re-running training.")
         
-        # Step A: Programmatically modify config.py
-        try:
-            set_config_variant(variant)
-        except Exception as e:
-            err_trace = traceback.format_exc()
-            print(f"❌ Failed to set config variant: {e}")
-            log_error(variant, err_trace)
+        # Step A: Resolve this variant's self-contained training entrypoint.
+        # (The folder's train.py applies the baseline's config, so we no longer
+        #  mutate src/config.py here.)
+        train_entry = VARIANT_TO_FOLDER.get(variant)
+        if train_entry is None:
+            print(f"❌ No baselines/ folder mapped for variant {variant}; skipping.")
+            log_error(variant, f"No VARIANT_TO_FOLDER entry for {variant}")
             continue
-        
+
         # Step C: Run training with batch size fallback logic (32 -> 16)
         batch_size = 32
         success = False
-        
+
         while batch_size >= 16:
-            print(f"👉 Launching train.py with Batch Size: {batch_size}...")
-            
+            print(f"👉 Launching {train_entry} with Batch Size: {batch_size}...")
+
             cmd = [
-                python_bin, 
+                python_bin,
                 "-u",
-                "scripts/train.py", 
-                "--epochs", "50", 
-                "--batch_size", str(batch_size), 
-                "--checkpoint_dir", ckpt_dir, 
-                "--variant", variant
+                train_entry,
+                "--epochs", "50",
+                "--batch_size", str(batch_size),
             ]
             
             # Step D: Execute process and stream stdout in real-time

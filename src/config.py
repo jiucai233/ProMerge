@@ -1,5 +1,10 @@
 import os
+import sys as _sys
 os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = "1"
+# Headless cloud GPU box (Linux): use EGL for MuJoCo offscreen rendering so eval /
+# online-eval works without a display. No effect on macOS (uses its own GL backend).
+if _sys.platform == "linux":
+    os.environ.setdefault("MUJOCO_GL", "egl")
 import torch
 from enum import Enum
 
@@ -9,6 +14,7 @@ class PolicyVariant(Enum):
     TOME_CLUSTERING = 3 # 竞品组：纯视觉双边聚类 Token Merging (压缩到 30%)
     PROMERGE_ONLY = 4   # 消融组：仅利用 Qpos 余弦打分剪枝 (保留 30%)
     PROMERGE_FILM = 5   # 终极形态：VLA低频语义FiLM调制 + Qpos余弦打分剪枝 (30%)
+    THINKPROPRIO = 6    # 竞品论文复现：[指令; 本体感知] 引导的投票式硬剪枝 (Gumbel+STE, ViT)
 
 class EvalNoise(Enum):
     NONE = 0
@@ -33,6 +39,17 @@ CONFIG = {
     "gate_num_queries": 8,      # Cross-attention 查询向量数
     "gate_num_heads": 4,        # Cross-attention 头数
     "merge_tokens": True,       # True: Token Merging (ToMe), False: Token Pruning (Hard Selection)
+    # === ThinkProprio baseline (Sec 3.3) ===
+    "tp_num_bins": 256,         # 本体感知文本分箱数 (论文 256 bins over [-3,3])
+    "tp_alpha_start": 1.0,      # Gumbel 噪声初始温度
+    "tp_alpha_end": 0.01,       # Gumbel 噪声终止温度 (cosine 退火)
+    "tp_anneal_steps": 5000,    # Gumbel 温度退火的训练步数
+    # === Early stopping (used by experiments/_trainer.py) ===
+    "early_stop_enabled": True,
+    "early_stop_patience": 5,   # 连续多少次验证 (每10个epoch一次) 无提升则停
+    "early_stop_min_delta": 1e-3,
+    # === DataLoader workers (0 on mac/MPS; set DATALOADER_WORKERS=8 on a cloud GPU box) ===
+    "dataloader_workers": int(os.environ.get("DATALOADER_WORKERS", "0")),
 }
 
 
