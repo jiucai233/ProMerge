@@ -13,14 +13,18 @@ verify the obs key names against OBS_KEYS before training.
 import os
 
 NAME = "LIBERO-Spatial"
-NAME_SLUG = "libero_spatial"
-DESCRIPTION = "Real LIBERO-Spatial suite (10 tasks), ViT-Small + CLIP-instruction guidance."
+# Suite is switchable via LIBERO_SUITE env (libero_spatial|libero_object|
+# libero_goal|libero_10). Lets us test whether the g_vis fix generalizes beyond
+# Spatial (guard against overfitting to one suite).
+SUITE = os.environ.get("LIBERO_SUITE", "libero_spatial")
+NAME_SLUG = "libero_spatial"  # checkpoint/experiment dir stays stable
+DESCRIPTION = f"Real LIBERO suite ({SUITE}), ViT-Small + CLIP-instruction guidance."
 EVAL = "libero_official"  # real success-rate eval; needs the libero env (run on a GPU box)
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# Where the per-task LIBERO-Spatial *.hdf5 demo files live.
-DATA_DIR = os.environ.get("LIBERO_SPATIAL_DIR", os.path.join(_ROOT, "data", "libero_spatial"))
+# Where the per-task LIBERO *.hdf5 demo files live (follows LIBERO_SUITE).
+DATA_DIR = os.environ.get("LIBERO_SPATIAL_DIR", os.path.join(_ROOT, "data", SUITE))
 
 # Observation/action layout (LIBERO-Spatial defaults; adjust after `--mode inspect`).
 IMAGE_SIZE = (128, 128)        # native LIBERO resolution; (112,112) matches the paper

@@ -1,3 +1,4 @@
+import os
 """
 PerceptualGatekeeper v2: Multi-Head Cross-Attention Gate.
 
@@ -68,11 +69,37 @@ class PerceptualGatekeeper(nn.Module):
 
         # PROMERGE_FILM (Variant 5) dynamic intent filter generator
         self.intent_filter_proj = nn.Linear(slow_semantic_dim, feature_dim)
+        # Small-init the intent filter (PROMERGE_INIT=small) so g_kin starts near
+        # uniform (~0.5 after sigmoid) instead of a random direction that injects
+        # noisy gating from step 0. Random init is the suspected cause of the high
+        # seed-to-seed variance (53-75% across seeds). Test if small init reduces it.
+        if os.environ.get("PROMERGE_INIT", "default") == "small":
+            nn.init.normal_(self.intent_filter_proj.weight, std=1e-3)
+            nn.init.zeros_(self.intent_filter_proj.bias)
+
+        # Cross-attention intent grounding (PROMERGE_FILM, gkin_mode="xattn").
+        # Replaces the bilinear dot-product (which collapses the instruction-vs-
+        # token relation into a single scalar and cannot ground language to the
+        # right object) with multi-head cross-attention: the instruction is a
+        # query attending over visual tokens, and the attention weights become
+        # the per-token intent gate g_kin. This preserves structured, non-linear
+        # text<->vision alignment instead of a lossy linear projection.
+        self.intent_q_proj = nn.Linear(slow_semantic_dim, feature_dim)
+        self.intent_xattn = nn.MultiheadAttention(
+            embed_dim=feature_dim, num_heads=num_heads, batch_first=True
+        )
 
         # ============================================================
         # FiLM semantic modulation (for PROMERGE_FILM variant)
         # ============================================================
         self.film_generator = nn.Linear(slow_semantic_dim, feature_dim * 2)
+        # Zero-init so FiLM starts as the identity transform:
+        # src_modulated = visual_tokens * (1 + 0) + 0 = visual_tokens.
+        # Without this the randomly-initialized gamma/beta scramble the visual
+        # tokens from step 0, which prevented PROMERGE_FILM from converging
+        # (gripper output collapsed to a constant -> 0% success).
+        nn.init.zeros_(self.film_generator.weight)
+        nn.init.zeros_(self.film_generator.bias)
 
         # Saved gate masks for visualization
         self.last_g_kin = None
@@ -184,12 +211,27 @@ class PerceptualGatekeeper(nn.Module):
 
             # ---- g_kin: Target-Centric Gate ----
             if CONFIG["variant"] == PolicyVariant.PROMERGE_FILM:
-                # Option 2 (biomimetic): Generate target filter w from slow_semantic
                 if slow_semantic is not None:
-                    w = self.intent_filter_proj(slow_semantic)  # [batch_size, D]
-                    # Compute dot product: V [batch_size, N, D] * w [batch_size, D, 1] -> [batch_size, N]
-                    scores = torch.bmm(src_modulated, w.unsqueeze(-1)).squeeze(-1)
-                    g_kin = torch.sigmoid(scores / math.sqrt(C)).unsqueeze(-1)  # [batch_size, N, 1]
+                    gkin_mode = os.environ.get("PROMERGE_GKIN", "dot")
+                    if gkin_mode == "xattn":
+                        # Cross-attention grounding: instruction = query, visual
+                        # tokens = key/value. The attention weights (query over
+                        # all N tokens) are the per-token intent gate.
+                        q = self.intent_q_proj(slow_semantic).unsqueeze(1)   # [B, 1, D]
+                        _, attn_w = self.intent_xattn(
+                            q, src_modulated, src_modulated,
+                            need_weights=True, average_attn_weights=True,
+                        )  # attn_w: [B, 1, N]
+                        a = attn_w.squeeze(1)                                # [B, N]
+                        # normalize to [0,1] per sample so it acts as a gate
+                        a_min = a.min(dim=1, keepdim=True).values
+                        a_max = a.max(dim=1, keepdim=True).values
+                        g_kin = ((a - a_min) / (a_max - a_min + 1e-8)).unsqueeze(-1)  # [B, N, 1]
+                    else:
+                        # Legacy bilinear dot-product (lossy; kept for ablation).
+                        w = self.intent_filter_proj(slow_semantic)  # [batch_size, D]
+                        scores = torch.bmm(src_modulated, w.unsqueeze(-1)).squeeze(-1)
+                        g_kin = torch.sigmoid(scores / math.sqrt(C)).unsqueeze(-1)  # [batch_size, N, 1]
                 else:
                     g_kin = torch.ones(batch_size, N, 1, device=visual_tokens.device)
             else:
@@ -211,14 +253,46 @@ class PerceptualGatekeeper(nn.Module):
                 g_kin = torch.sigmoid(self.gate_head(gate_input))  # [batch_size, N, 1]
 
             # ---- g_vis: Visual Saliency Gate ----
-            self_attn = torch.bmm(src_modulated, src_modulated.permute(0, 2, 1))  # [batch_size, N, N]
-            importance = self_attn.sum(dim=-1).unsqueeze(-1)  # [batch_size, N, 1]
+            # NOTE: self_attn.sum() measures how SIMILAR a token is to all others
+            # = "background homogeneity", NOT saliency. Big homogeneous regions
+            # (the dark cabinet, the table) score HIGH, while a unique target
+            # object (the small black bowl) scores LOW — the opposite of saliency.
+            # PROMERGE_GVIS=uniqueness flips this: a token is salient when it is
+            # DISSIMILAR from the rest (cosine-based uniqueness).
+            gvis_mode = os.environ.get("PROMERGE_GVIS", "sum")
+            if gvis_mode == "uniqueness":
+                vn = F.normalize(src_modulated, p=2, dim=-1)                 # cosine space
+                sim = torch.bmm(vn, vn.permute(0, 2, 1))                     # [B, N, N] in [-1,1]
+                mean_sim = sim.mean(dim=-1, keepdim=True)                    # avg similarity to others
+                importance = (-mean_sim)                                    # unique = low avg sim
+            else:
+                self_attn = torch.bmm(src_modulated, src_modulated.permute(0, 2, 1))
+                importance = self_attn.sum(dim=-1).unsqueeze(-1)            # legacy (background homogeneity)
             imp_min = importance.min(dim=1, keepdim=True).values
             imp_max = importance.max(dim=1, keepdim=True).values
             g_vis = (importance - imp_min) / (imp_max - imp_min + 1e-8)  # [batch_size, N, 1]
 
             # ---- Hybrid Gate Fusion ----
-            g_hybrid = torch.max(g_kin, g_vis)  # [batch_size, N, 1]
+            # Diagnostic switches (eval-only, env-controlled) to attribute the
+            # contribution of the intent gate vs. the saliency gate:
+            #   PROMERGE_GATE=vis  -> use only g_vis (pure saliency, ToMe-like)
+            #   PROMERGE_GATE=kin  -> use only g_kin (pure intent)
+            #   (default)          -> max(g_kin, g_vis)
+            _gate_mode = os.environ.get("PROMERGE_GATE", "hybrid")
+            if _gate_mode == "vis":
+                g_hybrid = g_vis
+            elif _gate_mode == "kin":
+                g_hybrid = g_kin
+            elif _gate_mode == "w82":          # intent-dominant weighted sum
+                g_hybrid = 0.8 * g_kin + 0.2 * g_vis
+            elif _gate_mode == "w91":
+                g_hybrid = 0.9 * g_kin + 0.1 * g_vis
+            elif _gate_mode == "mult":         # multiplicative: saliency modulates intent
+                g_hybrid = g_kin * (0.5 + 0.5 * g_vis)
+            elif _gate_mode == "kin_visfloor": # intent leads, saliency only as a weak floor
+                g_hybrid = torch.maximum(g_kin, 0.3 * g_vis)
+            else:
+                g_hybrid = torch.max(g_kin, g_vis)  # [batch_size, N, 1]
 
             # Apply temporal smoothing only during inference (eval mode)
             if not self.training:
@@ -235,25 +309,32 @@ class PerceptualGatekeeper(nn.Module):
             gate_mask = torch.clamp(g_hybrid, min=0.05)  # [batch_size, N, 1]
             src_modulated = src_modulated * gate_mask
 
-            # ---- Spatial Dilution (Morphological Dilatation) on the 15x20 Grid ----
+            # ---- Spatial Dilution (Morphological Dilatation) ----
+            # Infer the per-camera grid from the token count instead of hardcoding
+            # img_size//patch (which breaks for CLIP-B/32: 49 tokens = 7x7).
             img_size = CONFIG.get("image_size", (480, 640))
-            if CONFIG.get("backbone") == "vit_small":
-                H_feat = img_size[0] // 16
-                W_feat = img_size[1] // 16
+            patch = 16 if CONFIG.get("backbone") == "vit_small" else (
+                32 if CONFIG.get("backbone") == "clip_vit" else 32)
+            H_feat = img_size[0] // patch
+            W_feat = img_size[1] // patch
+            num_cameras = max(1, N // (H_feat * W_feat))
+            if num_cameras * H_feat * W_feat != N:
+                # Grid doesn't divide N (e.g. CLIP square grid): derive a square
+                # grid per camera from N. If still not square, skip dilation.
+                ncam = len(CONFIG.get("camera_names", ["front", "wrist"])) if CONFIG.get("camera_names") else 2
+                per_cam = N // ncam
+                side = int(round(per_cam ** 0.5))
+                if side * side == per_cam:
+                    num_cameras, H_feat, W_feat = ncam, side, side
+                else:
+                    num_cameras = None  # skip dilation
+
+            if num_cameras is not None:
+                scores_2d = g_hybrid.view(batch_size * num_cameras, 1, H_feat, W_feat)
+                scores_dilated_2d = F.max_pool2d(scores_2d, kernel_size=3, stride=1, padding=1)
+                scores_dilated = scores_dilated_2d.view(batch_size, N)
             else:
-                H_feat = img_size[0] // 32
-                W_feat = img_size[1] // 32
-            
-            num_cameras = N // (H_feat * W_feat)
-            
-            # Reshape scores to 2D: [batch_size * num_cameras, 1, H_feat, W_feat]
-            scores_2d = g_hybrid.view(batch_size * num_cameras, 1, H_feat, W_feat)
-            
-            # Perform 1-step spatial dilation via MaxPool2d
-            scores_dilated_2d = F.max_pool2d(scores_2d, kernel_size=3, stride=1, padding=1)
-            
-            # Reshape back to [batch_size, N]
-            scores_dilated = scores_dilated_2d.view(batch_size, N)
+                scores_dilated = g_hybrid.view(batch_size, N)  # no dilation
 
             # ---- Top-K Token Selection/Merging on Dilated Scores ----
             if CONFIG.get("merge_tokens", True):

@@ -57,18 +57,30 @@ class DETRVAE(nn.Module):
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
 
         # Determine backbone type
-        self.use_vit = CONFIG.get("backbone", "resnet18") == "vit_small"
+        _bb = CONFIG.get("backbone", "resnet18")
+        self.use_vit = _bb in ("vit_small", "clip_vit")
+        self.use_clip_vit = _bb == "clip_vit"
 
         if self.use_vit:
-            # ViT-Small backbone (shared across cameras)
-            self.vit_backbone = ViTBackbone(
-                img_size=CONFIG.get("image_size", (480, 640)),
-                pruning_layer=CONFIG.get("vit_pruning_layer", 6),
-                pretrained=True
-            )
+            if self.use_clip_vit:
+                # CLIP ViT-B/32 backbone: vision encoder in the SAME space as the
+                # CLIP text encoder used for instructions, so intent grounding
+                # (g_kin) is meaningful. Output 768-d -> project to hidden_dim.
+                from .vit_backbone import CLIPViTBackbone
+                self.vit_backbone = CLIPViTBackbone(
+                    pruning_layer=CONFIG.get("vit_pruning_layer", 6),
+                    pretrained=True,
+                )
+                self.clip_feat_proj = nn.Linear(self.vit_backbone.embed_dim, hidden_dim)
+            else:
+                # ImageNet ViT-Small (original).
+                self.vit_backbone = ViTBackbone(
+                    img_size=CONFIG.get("image_size", (480, 640)),
+                    pruning_layer=CONFIG.get("vit_pruning_layer", 6),
+                    pretrained=True
+                )
+                self.clip_feat_proj = None
             self.input_proj_robot_state = nn.Linear(state_dim, hidden_dim)
-            # Learned positional embedding for pruned visual tokens
-            # Max tokens = num_cameras * num_patches = 2 * 1200 = 2400
             max_tokens = len(camera_names) * self.vit_backbone.num_patches
             self.visual_pos_embed = nn.Parameter(
                 torch.randn(1, max_tokens, hidden_dim) * 0.02
@@ -142,7 +154,31 @@ class DETRVAE(nn.Module):
             latent_sample = torch.zeros([bs, self.latent_dim], dtype=torch.float32).to(qpos.device)
             latent_input = self.latent_out_proj(latent_sample)
 
-        if self.use_vit:
+        if self.use_clip_vit:
+            # === CLIP ViT PATH ===
+            # CLIP's later layers require 768-d inputs, so we cannot prune at a
+            # mid layer like the timm ViT. Instead: run the FULL CLIP encoder,
+            # project 768->hidden_dim (into the same space the gatekeeper/ACT
+            # expect), then let the gatekeeper select/merge tokens on the final
+            # CLIP features. CLIP-B/32 only yields 49 tokens/cam so there is no
+            # compute concern — the point here is CLIP-text<->CLIP-vision
+            # ALIGNMENT for intent grounding, not token-count savings.
+            all_cam_tokens = []
+            for cam_id, cam_name in enumerate(self.camera_names):
+                ct = self.vit_backbone.forward(image[:, cam_id])      # [B, 49, 768]
+                ct = self.clip_feat_proj(ct)                          # [B, 49, hidden_dim]
+                all_cam_tokens.append(ct)
+            src_tokens = torch.cat(all_cam_tokens, dim=1)             # [B, 2*49, hidden_dim]
+            pos_tokens = self.visual_pos_embed[:, :src_tokens.shape[1], :].expand(bs, -1, -1)
+            src_final, pos_pruned = self.gatekeeper(
+                src_tokens, qpos, slow_semantic=slow_semantic, pos_tokens=pos_tokens
+            )
+            proprio_input = self.input_proj_robot_state(qpos)
+            src = src_final.unsqueeze(2).permute(0, 3, 2, 1)
+            pos = pos_pruned.unsqueeze(2).permute(0, 3, 2, 1)
+            hs = self.transformer(src, None, self.query_embed.weight, pos, latent_input, proprio_input, self.additional_pos_embed.weight)[0]
+
+        elif self.use_vit:
             # === ViT BACKBONE PATH (with mid-layer pruning) ===
             all_cam_tokens = []
             for cam_id, cam_name in enumerate(self.camera_names):
@@ -306,9 +342,9 @@ def build_encoder(args):
 def build(args):
     state_dim = args.state_dim
 
-    # Build backbone (skip for ViT — it's created inside DETRVAE)
+    # Build backbone (skip for ViT and CLIP-ViT — both are created inside DETRVAE)
     backbones = None
-    if CONFIG.get("backbone", "resnet18") != "vit_small":
+    if CONFIG.get("backbone", "resnet18") not in ("vit_small", "clip_vit"):
         backbones = []
         backbone = build_backbone(args)
         backbones.append(backbone)

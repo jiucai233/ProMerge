@@ -12,3 +12,4 @@ result/
 eval_results_matrix.md
 *.png
 logs/
+external/

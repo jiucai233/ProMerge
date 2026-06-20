@@ -69,7 +69,11 @@ def train_experiment(experiment, baseline_name, epochs=50, batch_size=16,
                      checkpoint_dir=None, device=None):
     import config as cfgmod
     from config import CONFIG, POLICY_CONFIG
-    from utils import make_policy, make_optimizer
+    from utils import make_policy, make_optimizer, set_seed
+
+    # Seed everything for reproducible / valid multi-seed runs (PROMERGE_SEED).
+    _seed = int(os.environ.get("PROMERGE_SEED", "0"))
+    set_seed(_seed)
 
     device = device or cfgmod.device
 
@@ -190,9 +194,13 @@ def train_experiment(experiment, baseline_name, epochs=50, batch_size=16,
                 sys.exit(0)
         train_loss = tot / max(n, 1)
 
-        # Validation every 10 epochs
+        # Validate every epoch. (Was every 10 epochs, which made sense when an
+        # "epoch" was ~14 batches; now an epoch is ~1756 batches over all frames,
+        # so per-epoch validation is both affordable and needed for early
+        # stopping / best-checkpoint selection to react in time.)
         val_loss = None
-        if (epoch + 1) % 10 == 0:
+        val_every = int(CONFIG.get("val_every_epochs", 1))
+        if (epoch + 1) % val_every == 0:
             policy.eval()
             vt = vn = 0
             with torch.no_grad():

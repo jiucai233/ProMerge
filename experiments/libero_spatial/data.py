@@ -82,9 +82,18 @@ class LiberoSpatialDataset(torch.utils.data.Dataset):
         self.chunk = chunk
         self.instruction_embeds = instruction_embeds  # {instruction_str: tensor[384]}
         self._handles = {}
+        # Expand to PER-FRAME samples. Previously __len__ was the number of
+        # demos (~450) and __getitem__ took ONE random frame per demo per epoch,
+        # so >99% of demonstration frames were never trained on and every
+        # variant badly underfit (val L1 stuck ~0.25-0.4). Index every frame of
+        # every demo so one epoch traverses all ~N*T frames.
+        self.frame_index = []
+        for ei, ep in enumerate(episode_index):
+            for t in range(ep["length"]):
+                self.frame_index.append((ei, t))
 
     def __len__(self):
-        return len(self.episode_index)
+        return len(self.frame_index)
 
     def _file(self, path):
         if path not in self._handles:
@@ -92,12 +101,12 @@ class LiberoSpatialDataset(torch.utils.data.Dataset):
         return self._handles[path]
 
     def __getitem__(self, idx):
-        ep = self.episode_index[idx]
+        ei, start = self.frame_index[idx]
+        ep = self.episode_index[ei]
         f = self._file(ep["file"])
         demo = f["data"][ep["demo"]]
         obs = demo["obs"]
         T = ep["length"]
-        start = np.random.randint(0, T)
 
         ak = _resolve_obs_key(obs, C.OBS_KEYS["agentview"])
         wk = _resolve_obs_key(obs, C.OBS_KEYS["eye_in_hand"])

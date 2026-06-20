@@ -1,3 +1,4 @@
+import os
 """ProMerge-FiLM — OUR final method config (single source of truth).
 
 Ours, final form: high-level semantic intent (slow_semantic) modulates visual
@@ -17,12 +18,12 @@ VARIANT = "PROMERGE_FILM"
 CHECKPOINT_DIR = "checkpoints/PROMERGE_FILM"
 
 CONFIG_OVERRIDES = {
-    "backbone": "vit_small",
+    "backbone": os.environ.get("PROMERGE_BACKBONE", "vit_small"),
     "keep_ratio": 0.3,
     "merge_tokens": True,
 }
 POLICY_OVERRIDES = {
     "hidden_dim": 384,
     "dim_feedforward": 1536,
-    "backbone": "vit_small",
+    "backbone": os.environ.get("PROMERGE_BACKBONE", "vit_small"),
 }

@@ -1,65 +1,86 @@
-# ProMerge: Visual Embodied AI Policy Training & Evaluation
+# ProMerge — Intent-Guided Visual Token Compression for Lightweight VLA (a documented negative result)
 
-This repository implements the training and evaluation pipeline for ACT (Action Chunking with Transformers) policies combined with the **ProMerge** visual token pruning framework. The system is designed to run on macOS (Apple Silicon MPS hardware acceleration) and is fully integrated with MuJoCo physical sandbox simulation.
+> **Research log, not a product.** This repo is an honest, end-to-end study of one
+> idea — *can a lightweight, VLM-free Vision-Action policy use intent-guided visual
+> token compression to stay accurate while running fast on LIBERO manipulation?*
+> The short answer, after a full set of controlled experiments, is **no**, and the
+> interesting part is **why**. Full write-up: **[NEGATIVE_RESULT.md](NEGATIVE_RESULT.md)**.
 
----
+## The question
 
-## 🛠️ Step-by-Step Commands
+Heavy VLA pipelines (OpenVLA-7B, π0, ThinkProprio w/ Florence-2 + DiT) are accurate
+but slow. I wanted to know whether a **ViT-Small + ACT** backbone — no 7B VLM — could
+(a) follow language by **compressing visual tokens under instruction guidance** and
+(b) run at high control frequency, trading a little success rate for a lot of speed.
 
-### 1. Data Generation (Expert Dataset)
+## What I built
 
-To regenerate the 5-DOF dynamic interception expert dataset containing real visual frames from the front and wrist cameras, run:
+- A 6-variant LIBERO benchmark harness (monolithic ACT, random prune, ToMe, ProMerge
+  intent-gate, ThinkProprio reimpl., FiLM) with a **suite-switchable** runner
+  (spatial / object / goal / long) and env-controlled ablation switches.
+- A `PerceptualGatekeeper` that fuses a **top-down intent gate** (instruction →
+  visual tokens) with a **bottom-up saliency gate**, then soft-merges tokens (ToMe).
+- Open-loop action-chunk execution aligned with the OpenVLA-OFT LIBERO protocol,
+  attention visualizations, and a 3-seed evaluation protocol.
 
-```bash
-python data/data_generation.py
+## What I found (the honest part)
+
+| Config | LIBERO-Spatial success |
+|---|---|
+| Pure saliency merge (ToMe) | **73%** |
+| ProMerge intent-gate (best single run) | 75.5% → **60.2% (3-seed avg)** |
+| + fixed saliency / small-init (variance reduced, ceiling unchanged) | ~65% |
+| CT-VAM (full tokens, no compression — literature) | 82% |
+
+Across **3 suites × 3 seeds**, intent-guided compression **never reliably beats a
+parameter-free saliency merger**, and is far behind full-token methods. It is not a
+tuning problem — it is the idea:
+
+1. **Token compression isn't the "cerebellum's" job.** Deciding *where to look* is
+   top-down attention + saliency (cortex/colliculus), not low-level execution.
+   The no-VLM methods that *do* work (CT-VAM, VITA) **keep all tokens**.
+2. **"Fast" optimizes the wrong axis.** In manipulation, success rate is the binding
+   constraint; the compression trades success for speed unfavorably.
+3. **No-VLM + token compression has no reliable grounding signal** to select tokens
+   by, so compression mostly destroys information.
+
+## Diagnostics worth reading
+
+- The **saliency gate was inverted**: `self_attn.sum()` scored *background
+  homogeneity* (the big dark cabinet lit up, not the target bowl). Visualizing the
+  gates caught it; a cosine-uniqueness fix corrected the heatmaps. *(real bug found
+  by looking at the attention maps, not the loss)*
+- **Intent grounding never localized the target**: probing g_kin across instructions
+  showed weak, non-target-specific responses — CLIP-text vs. ViT-vision features are
+  not aligned enough for a no-VLM dot-product / cross-attention to ground language.
+- **High seed variance (53–75%)** traced to random init of the intent filter;
+  small-init reduced variance but not the ceiling.
+
+## Why this is here
+
+Most of the value of a research project is in the reasoning, not the final number.
+This repo documents the full loop — hypothesis → implementation → failure →
+diagnosis → re-test → accepting a robust negative result — including the bugs I
+found and the literature (CT-VAM, LightVLA, ThinkProprio, VITA) that explains why
+the idea sits in a dead cell. The harness, ablation switches, and 3-seed protocol
+are reusable.
+
+## Repo layout
+
+```
+src/detr/models/perceptual_gatekeeper.py   # intent + saliency gating, ablation switches
+src/detr/models/vit_backbone.py            # ViT-Small + CLIP-ViT backbones, mid-layer pruning
+experiments/libero_spatial/                # suite-switchable train/eval on LIBERO
+baselines/                                 # the 6 variants
+NEGATIVE_RESULT.md                         # full write-up + numbers
+RESULTS_*.md                               # raw per-experiment logs (3-seed, cross-suite, sweeps)
 ```
 
-- **Dataset output**: `data/episodes_500_tuple.hdf5` (~814 MB, gzip compressed)
-- **Configurations**: Default is 50 episodes of 400 steps each.
-
-### 2. Policy Training
-
-To train the ACT models from scratch under MPS acceleration:
-
-#### Option A: Train All 5 Variants Sequentially (Orchestration Coordinator)
-
-This will sequentially train `MONOLITHIC_ACT`, `RANDOM_PRUNE`, `TOME_CLUSTERING`, `PROMERGE_ONLY`, and `PROMERGE_FILM` for 15 epochs each, storing checkpoint weights in `checkpoints/<VARIANT>/`:
+## Reproduce
 
 ```bash
-python coordinator_train.py
+bash cloud/setup.sh                     # deps + LIBERO env (Linux/CUDA, EGL headless)
+# train+eval the best config on a suite:
+PROMERGE_GATE=kin PROMERGE_GVIS=uniqueness LIBERO_SUITE=libero_spatial \
+  python experiments/run.py --experiment libero_spatial --baseline promerge_film --mode train
 ```
-
-#### Option B: Train a Single Specific Policy Variant
-
-To train a single variant manually, run `train.py` with custom arguments:
-
-```bash
-python train.py --epochs 15 --batch_size 32 --checkpoint_dir checkpoints/MONOLITHIC_ACT --variant MONOLITHIC_ACT
-```
-
-- **Available Variants**: `MONOLITHIC_ACT`, `RANDOM_PRUNE`, `TOME_CLUSTERING`, `PROMERGE_ONLY`, `PROMERGE_FILM`
-
-### 3. Evaluation & Benchmarking (Inference)
-
-To run evaluations under realistic PD joint actuation, visual renderings, and randomized target conditions:
-
-#### Option A: Run the Complete Evaluation Pipeline (1000 Rollouts)
-
-Runs all 4 physical scenarios (Static, Dynamic, Flicker, Shadow) across all 5 variants ($5 \times 4 \times 50$ rollouts), dynamically computes GFLOPs complexity metrics, and outputs the final markdown results matrix:
-
-```bash
-python run_eval_pipeline.py
-```
-
-- **Report Output**: `eval_results_matrix.md`
-
-#### Option B: Run a Single Specific Scenario Manually
-
-Run `sim/benchmark_eval.py` to evaluate custom tasks, noise, and rollout lengths:
-
-```bash
-python sim/benchmark_eval.py --task dyn_intercept --noise FLICKER --num_rollouts 50 --variant PROMERGE_FILM
-```
-
-- **Tasks**: `static_manipulation`, `dyn_intercept`
-- **Noise Categories**: `NONE`, `FLICKER`, `LOCAL_SHADOW`

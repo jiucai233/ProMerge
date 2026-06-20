@@ -25,7 +25,9 @@ class EvalNoise(Enum):
 CONFIG = {
     "variant": PolicyVariant.PROMERGE_FILM,
     "eval_noise": EvalNoise.NONE,
-    "keep_ratio": 0.3,          # Token 预算留存率
+    # keep_ratio overridable via env (PROMERGE_KEEP_RATIO) for the
+    # token-compression pareto sweep (success vs. latency at 0.1/0.2/0.3/0.5/0.7).
+    "keep_ratio": float(os.environ.get("PROMERGE_KEEP_RATIO", "0.3")),  # Token 预算留存率
     "num_cameras": 2,           # 默认多相机：前视 + 手腕
     "chunk_size": 50,           # ACT 的 Action Chunking 长度
     "qpos_dim": 9,              # 9-DOF 关节状态维度 (7个手臂关节 + 2个手指)
@@ -34,7 +36,7 @@ CONFIG = {
     "num_epochs": 50,           # 快速演示训练 50 epoch
     "image_size": (240, 320),   # 图像输入分辨率 (height, width)
     # === ProMerge v2: ViT Backbone + Cross-Attention Gate ===
-    "backbone": "vit_small",    # 'resnet18' | 'vit_small'
+    "backbone": os.environ.get("PROMERGE_BACKBONE", "vit_small"),  # 'resnet18' | 'vit_small' | 'clip_vit'
     "vit_pruning_layer": 6,     # 在 ViT 第几层后做剪枝 (0-indexed)
     "gate_num_queries": 8,      # Cross-attention 查询向量数
     "gate_num_heads": 4,        # Cross-attention 头数
@@ -100,7 +102,9 @@ POLICY_CONFIG = {
     'dec_layers': 7,
     'nheads': 8,               # 384 / 8 = 48 per head
     'camera_names': ['front'],
-    'temporal_agg': True,
+    'temporal_agg': True,       # (unused by LIBERO eval — see num_open_loop_steps)
+    'num_open_loop_steps': 8,   # LIBERO eval: execute 8 chunk steps then re-query
+                                # (OpenVLA-OFT protocol; far better than temporal_agg here)
 
     # =========================================================================
     # 🚀 PROMERGE EXCLUSIVE HYPERPARAMETERS (我们的独家 IP 控制阀门)

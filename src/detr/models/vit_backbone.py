@@ -95,3 +95,72 @@ class ViTBackbone(nn.Module):
         tokens = self.forward_first_half(x)
         tokens = self.forward_second_half(tokens)
         return tokens
+
+
+class CLIPViTBackbone(nn.Module):
+    """CLIP ViT-B/32 visual backbone with the same mid-layer-pruning interface
+    as ViTBackbone (forward_first_half / forward_second_half / forward).
+
+    Why: the instruction is encoded with CLIP's TEXT encoder, but the original
+    visual backbone was an ImageNet-pretrained timm ViT — a DIFFERENT embedding
+    space. Intent grounding (g_kin) failed because CLIP-text and ImageNet-ViT
+    features are not aligned. Using CLIP's VISION encoder puts text and vision
+    in the SAME CLIP space, so dot-product / cross-attention grounding becomes
+    meaningful.
+
+    Notes / differences vs the timm ViT:
+      - embed_dim = 768 (vs 384) -> downstream hidden_dim must match (see config).
+      - patch32 @ 224 -> 49 patch tokens (vs 1200). Far fewer tokens already.
+      - CLS token is dropped to keep tokens purely spatial for the gatekeeper.
+    """
+    def __init__(self, img_size=(224, 224), pruning_layer=6, pretrained=True,
+                 model_name="openai/clip-vit-base-patch32"):
+        super().__init__()
+        from transformers import CLIPVisionModel
+        self.pruning_layer = pruning_layer
+        self.img_size = img_size
+        self.clip = CLIPVisionModel.from_pretrained(model_name)
+        # FREEZE the CLIP vision encoder: fine-tuning it would drift its features
+        # away from the CLIP TEXT space, destroying the very text<->vision
+        # alignment we adopted CLIP for. Only the downstream projection /
+        # gatekeeper / ACT are trained.
+        for p in self.clip.parameters():
+            p.requires_grad = False
+        self.clip.eval()
+        self.embed_dim = self.clip.config.hidden_size          # 768
+        self.num_blocks = self.clip.config.num_hidden_layers   # 12
+        ps = self.clip.config.patch_size                       # 32
+        self.grid_h = img_size[0] // ps                        # 7
+        self.grid_w = img_size[1] // ps                        # 7
+        self.num_patches = self.grid_h * self.grid_w           # 49
+        self.num_channels = self.embed_dim
+
+    def _embed(self, x):
+        vm = self.clip
+        # CLIP expects 224x224; resize if needed
+        if x.shape[-2:] != tuple(self.img_size):
+            x = nn.functional.interpolate(x, size=self.img_size, mode="bilinear", align_corners=False)
+        h = vm.embeddings(x)            # [B, 1+num_patches, D]  (CLS + patches)
+        h = vm.pre_layrnorm(h)
+        return h
+
+    def forward_first_half(self, x):
+        h = self._embed(x)             # [B, 1+N, D]
+        for i in range(self.pruning_layer):
+            h = self.clip.encoder.layers[i](h, attention_mask=None)
+        # drop CLS token -> purely spatial tokens for the gatekeeper
+        return h[:, 1:, :]             # [B, N, D]
+
+    def forward_second_half(self, tokens):
+        # tokens are spatial-only (CLS already removed / pruned); CLIP layers
+        # operate on the sequence as-is.
+        h = tokens
+        for i in range(self.pruning_layer, self.num_blocks):
+            h = self.clip.encoder.layers[i](h, attention_mask=None)
+        h = self.clip.post_layernorm(h)
+        return h
+
+    def forward(self, x):
+        tokens = self.forward_first_half(x)
+        tokens = self.forward_second_half(tokens)
+        return tokens
