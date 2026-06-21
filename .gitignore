@@ -13,3 +13,7 @@ eval_results_matrix.md
 *.png
 logs/
 external/
+
+# keep documentation figures
+!docs/figures/
+!docs/figures/*.png

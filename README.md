@@ -50,6 +50,16 @@ tuning problem — it is the idea:
   homogeneity* (the big dark cabinet lit up, not the target bowl). Visualizing the
   gates caught it; a cosine-uniqueness fix corrected the heatmaps. *(real bug found
   by looking at the attention maps, not the loss)*
+
+  | Inverted `g_vis` (`self_attn.sum`) — fires on the dark cabinet, not the target | Fixed `g_vis` (cosine uniqueness) — fires on the distinctive small objects |
+  |---|---|
+  | ![inverted](docs/figures/gvis_inverted_task0.png) | ![fixed](docs/figures/gvis_fixed_task0.png) |
+  | ![inverted](docs/figures/gvis_inverted_task4.png) | ![fixed](docs/figures/gvis_fixed_task4.png) |
+
+  *Left column of each image = scene, middle = `g_vis` (saliency), right = `g_kin`
+  (intent). Before the fix, "saliency" highlighted the large homogeneous cabinet;
+  after, it shifts to the distinctive objects — but note `g_kin` (intent) still
+  fails to localize the target, which is the deeper reason the method underperforms.*
 - **Intent grounding never localized the target**: probing g_kin across instructions
   showed weak, non-target-specific responses — CLIP-text vs. ViT-vision features are
   not aligned enough for a no-VLM dot-product / cross-attention to ground language.
